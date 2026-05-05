@@ -1,0 +1,626 @@
+---
+title: "Cleaning and Analysing California's Air Quality Data"
+format: 
+    html:
+        theme: cosmo
+---
+## Data Dictionary
+
+The `Ozone` dataset contains the daily air quality summary statistics by monitor for the state of California for 2024. Each row represents the air quality metrics per collection method and site for a specific date.
+
+| Variable | Description |
+|:---|:---|
+| **`Date`** | Calendar date associated with the air quality values |
+| **`Source`** | Data source: EPA's Air Quality System (AQS) or AirNow |
+| **`Site ID`** | Identifier for the air monitoring site |
+| **`POC`** | Identifier number for the specific monitor |
+| **`Daily Max 8-hour Ozone Concentration`** | Highest 8-hour value of the day for ozone concentration |
+| **`Units`** | Parts per million by volume (ppm) |
+| **`Daily AQI Value`** | Highest air quality index value for the day (50 = good, >300 = hazardous) |
+| **`Local Site Name`** | Name of the monitoring site |
+| **`Daily Obs Count`** | Number of observations reported in that day |
+| **`Percent Complete`** | Indicates whether all expected samples were collected |
+| **`Method Code`** | Identifier for the collection method |
+| **`CBSA Code`** | Identifier for the core base statistical area (CBSA) |
+| **`CBSA Name`** | Name of the core base statistical area |
+| **`State FIPS Code`** | Identifier for the state |
+| **`State`** | Name of the state |
+| **`County FIPS Code`** | Identifier for the county |
+| **`County`** | Name of the county |
+| **`Site Latitude`** | Latitude coordinates of the site |
+| **`Site Longitude`** | Longitude coordinates of the site |
+
+---
+
+## Research Objectives
+
+1. **Data Preparation:** Walk through a standard Exploratory Data Analysis (EDA) and data cleaning process.
+2. **Spatio-Temporal Variance:** Analyze how the daily maximum 8-hour ozone concentration varies over time and across different regions.
+3. **Hotspots & Methodology:** Identify areas that consistently show high ozone concentrations, and determine if different collection methods report different baseline ozone levels.
+4. **The Weekend Effect:** Investigate whether shifting urban activity (weekends vs. weekdays) has any significant effect on ozone levels.
+5. **Geospatial Mapping:** Plot a geospatial heatmap to visualize the distribution of high ozone concentrations across the state.
+
+## Data Preparation & Cleaning
+
+### Stage 1.1: Date Standardization & Sequence Reconstruction
+The primary challenge during the initial data cleaning phase was handling inconsistent date formats (e.g., `January/04/2024` vs. `01/02/2024`) and entirely malformed entries (e.g., `/2024`). 
+
+Rather than discarding rows with malformed dates, I utilised the implicit calendar order contained within the physical row structure of the dataset to mathematically reconstruct the timeline. 
+
+::: {.callout-tip title="Methodological Note: Site-Specific Reconstruction"}
+When reconstructing dates based on row position, I had to account for a critical structural trap: the dataset contains multiple monitoring sites (`Site ID`). Applying a global "add one day to the previous row" logic would cause December 31st of Site A to incorrectly bleed over and become January 1st of Site B. 
+
+To prevent this, the timeline was reconstructed **independently for each monitor site**. We anchored the sequence to the first valid date for a specific site, calculated the row offset for missing dates, and applied the exact day differentials to bridge the gaps.
+:::
+
+### Stage 1.2: Missing Data Imputation
+
+* **Target Variable Imputation:** Approximately 5% of the values in the **`Daily Max 8-hour Ozone Concentration`** column were missing. While 5% is generally an acceptable threshold for dropping rows, this is our primary variable of interest. Because daily ozone concentrations are heavily influenced by temporal persistence (weather and emissions from prior days), we imputed these gaps using a **5-day rolling mean** of the site's previous ozone levels. 
+
+    * *Exception:* 9 Rows missing concentration data on `01/01/2024` were dropped, as there was no prior historical data available for the rolling calculation. **54,750** rows left for corresponding analysis. 
+
+* **Non-Critical Variables:** Missing values remain
+
+**Below are the detailed process for data cleaning:**
+```{python} 
+# loading packages
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from itertools import combinations
+from scipy import stats
+```
+
+```{python}
+#| echo: true
+#| output: false
+
+#Loading data
+ozone = pd.read_csv('/Users/pengjunning/Desktop/pyhton projects/ozone EDA/ozone.csv')
+print('Dataset Shape:', ozone.shape)
+
+## Data cleaning process 
+# Standardize the date column 
+# Parse the dates we have, forcing '/2024' to become NaT (missing)
+ozone['Date_Temp'] = pd.to_datetime(ozone['Date'], errors='coerce')
+
+# Define a custom function to rebuild the calendar sequence
+def smart_fill_dates(group):
+    # Find where the dates are missing
+    is_missing = group.isna()
+    
+    # Create "blocks" that group missing rows with their nearest valid date above them
+    blocks = (~is_missing).cumsum()
+    
+    # Count how many missing days we are away from the valid date (0, 1, 2...)
+    days_to_add = pd.to_timedelta(group.groupby(blocks).cumcount(), unit='D')
+    
+    # Forward-fill the valid date down the column, then add the missing days
+    return group.ffill() + days_to_add
+
+# Apply this function, strictly grouped by each specific monitor
+ozone['Date_Fixed'] = ozone.groupby(['Site ID', 'POC'])['Date_Temp'].transform(smart_fill_dates)
+
+print(ozone[['Date', 'Date_Fixed']].head(20))
+
+# Checking for missing values
+print("Data Types and Missing Values:")
+print("\n", ozone.info())
+print("\nMissing Values Summary:")
+missing_summary = ozone.isnull().sum()
+missing_summary[missing_summary > 0]
+
+# Missing values of our main research of interest:
+print(round((ozone['Daily Max 8-hour Ozone Concentration'].isnull().sum()/len(ozone)),2) * 100,
+ "% in Daily Max 8-hour Ozone Concentration and Daily AQI Value are missing values")
+```
+
+```{python}
+#| echo: true
+#| output: false
+
+# Sort the data chronologically by Site and Date
+ozone = ozone.sort_values(by=['Site ID', 'POC', 'Date_Fixed'])
+
+# Calculate the 5-day rolling mean for each monitor independently
+# min_periods=1 ensures that even if there are only 2 prior days available, it still calculates a mean
+rolling_mean_5d = ozone.groupby(['Site ID', 'POC'])['Daily Max 8-hour Ozone Concentration'].transform(
+    lambda x: x.rolling(window=5, min_periods=1).mean()
+    )
+
+# Fill ONLY the missing values in the target column with this new rolling mean
+ozone['Daily Max 8-hour Ozone Concentration'] = ozone['Daily Max 8-hour Ozone Concentration'].fillna(rolling_mean_5d)
+
+# Verify the imputation was successful
+missing_after = ozone['Daily Max 8-hour Ozone Concentration'].isnull().sum()
+print(f"Missing values remaining: {missing_after}")
+
+ozone[ozone['Daily Max 8-hour Ozone Concentration'].isnull()]
+
+# Still have 1 missing value from AQS (60731201 side id) at 01/01/2024.
+# Because there is no previous data to reference upon. So we decide to drop this row.
+ozone = ozone.dropna(subset=['Daily Max 8-hour Ozone Concentration'])
+print(round((ozone['Daily Max 8-hour Ozone Concentration'].isnull().sum()/len(ozone)),2) * 100, "% are missing values")
+
+## We do the same NA filling on Daily AQI Value
+rolling_mean_5d_AQI = ozone.groupby(['Site ID', 'POC'])['Daily AQI Value'].transform(
+    lambda x: x.rolling(window=5, min_periods=1).mean()
+    )
+
+ozone['Daily AQI Value'] = ozone['Daily AQI Value'].fillna(rolling_mean_5d_AQI)
+
+missing_after = ozone['Daily AQI Value'].isnull().sum()
+
+print(f"Missing values remaining: {missing_after}")
+
+ozone[ozone['Daily AQI Value'].isnull()]
+
+# Still have 8 missing value all at 01/01/2024 (including 60010009,60290014, etc), 
+# because there is no previous data to reference upon. So we decide to drop these rows.
+
+ozone = ozone.dropna(subset=['Daily AQI Value'])
+print(round((ozone['Daily AQI Value'].isnull().sum()/len(ozone)),2) * 100, "% are missing values")
+
+print("Data Types and Missing Values:")
+print(ozone.info()) # checking if all columns has the expected data type 
+print("\nMissing Values Summary:")
+missing_summary = ozone.isnull().sum()
+print(missing_summary[missing_summary > 0])
+```
+
+## Stage 2.1: Introduction & Executive Summary
+
+### Understanding Ground-Level Ozone
+Before analyzing the 2024 monitoring data, it is crucial to understand what ozone is and why tracking its concentration is heavily prioritized by environmental agencies. 
+
+**What is Ground-Level Ozone?**
+Ozone is a highly reactive gas composed of three oxygen atoms. While ozone occurring naturally in the upper atmosphere (the stratosphere) protects the Earth from the sun's ultraviolet rays, ground-level (tropospheric) ozone is a harmful air pollutant. As the EPA commonly summarizes: *"Good up high, bad nearby."*
+
+**How is it Formed?**
+Unlike carbon monoxide or particulate matter, ground-level ozone is rarely emitted directly from a tailpipe or smokestack. Instead, it is a **secondary pollutant** created by complex chemical reactions between two primary compounds:
+
+1. **Nitrogen Oxides (NOx):** Emitted by heavy-duty vehicles, power plants, and industrial facilities.
+2. **Volatile Organic Compounds (VOCs):** Emitted by chemical plants, refineries, gasoline pumps, and even some natural vegetation.
+
+When NOx and VOCs mix in the presence of intense sunlight and heat, they bake together to form ozone. Because of this chemical requirement, ozone pollution is inextricably linked to the weather—making it a highly seasonal threat. 
+
+**Why Do We Study It?**
+
+Ground-level ozone is a severe respiratory irritant. Breathing it can trigger chest pain, coughing, and airway inflammation, and it poses a disproportionate risk to children, the elderly, and those with asthma. Because of these severe health impacts, the EPA has established a strict national safety standard: the Daily Maximum 8-hour Ozone Concentration should not exceed **0.070 ppm**. 
+
+By analyzing where and when these concentrations spike, researchers can identify hazardous geographical hotspots, evaluate the impact of human activity, and track compliance with federal clean air standards.
+
+---
+
+::: {.callout-note title="Executive Summary: 2024 California Ozone Trends"}
+*This analysis is based on **54,750 daily ozone observations** across **160 monitoring sites** in California, collected from two sources: the EPA's Air Quality System (AQS) and AirNow real-time sensors.*
+
+* **The Baseline:** The state-wide average and median ozone concentrations both sit at **0.043 ppm**. However, 2024 saw significant extreme weather outliers, with peak pollution events driving local concentrations to a hazardous maximum of **0.106 ppm**.
+
+* **The Seasonal Curve:** Ozone formation relies heavily on sunlight and heat. **Summer (0.051 ppm)** represents the peak pollution season, cresting specifically in **July (0.054 ppm)**. Conversely, **Winter (0.037 ppm)** is the cleanest season, bottoming out in **December (0.031 ppm)**. 
+
+* **The Weekend Effect:** Surprisingly, commuter and industrial schedules have almost zero impact on baseline averages. Weekdays (0.0436 ppm) and weekends (0.0432 ppm) are statistically identical. This is due to the "Weekend Ozone Effect"—while heavy diesel traffic drops on weekends, the lack of fresh NOx emissions prevents the natural breakdown (scavenging) of existing ground-level ozone.
+
+* **The Extremes:** While averages remain flat across the week, the absolute most severe pollution spikes still occur on weekdays (max **0.139 ppm**) compared to weekends (max **0.114 ppm**), when peak industrial emissions combine with extreme summer heat.
+
+* **Data Source Discrepancy:** AQS and AirNow diverge significantly during summer months. AQS records higher peak concentrations due to rigorous EPA QA/QC post-processing. Conversely, several AirNow sites in the Central Valley report suspiciously low values (e.g., 0.009–0.018 ppm), likely reflecting temporary sensor failures rather than true air quality.
+:::
+
+```{python}
+#| echo: true
+#| output: false
+
+# Create cleaned dataset
+ozone_clean = ozone.copy()
+
+# Drop unnecessary columns 
+ozone_clean = ozone_clean.drop(columns=["Date", "Date_Temp"])
+
+# Add temporal features for analysis
+ozone_clean['Year'] = ozone_clean['Date_Fixed'].dt.year
+
+ozone_clean['Month'] = ozone_clean['Date_Fixed'].dt.strftime('%b')
+months_order = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+                'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+ozone_clean['Month'] = pd.Categorical(ozone_clean['Month'],categories=months_order, ordered=True)
+
+days_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+ozone_clean['DayOfWeek'] = ozone_clean['Date_Fixed'].dt.day_name()
+ozone_clean['DayOfWeek'] = pd.Categorical(ozone_clean['DayOfWeek'], 
+                                          categories=days_order, 
+                                          ordered=True)
+
+ozone_clean['IsWeekend'] = ozone_clean['DayOfWeek'].isin(['Saturday', 'Sunday'])  
+
+ozone_clean['Season'] = ozone_clean['Month'].map({'Dec': 'Winter', 'Jan': 'Winter', 'Feb': 'Winter',
+                                                  'Mar': 'Spring', 'Apr': 'Spring', 'May': 'Spring',
+                                                  'Jun': 'Summer', 'Jul': 'Summer', 'Aug': 'Summer',
+                                                  'Sep': 'Fall', 'Oct': 'Fall', 'Nov': 'Fall'})
+ozone_clean['Season'] = pd.Categorical(ozone_clean['Season'], 
+                                          categories=['Spring', 'Summer', 'Fall', 'Winter'], 
+                                          ordered=True)
+print(ozone_clean.describe())  
+```
+
+```{python}
+#| echo: true
+#| output: false
+
+# Overall 
+overall_ozone_info = ozone_clean['Daily Max 8-hour Ozone Concentration'].agg(
+    ['mean', 'std', 'max', 'count']).round(4)
+print('Overall Ozone Statistics:')
+print(overall_ozone_info)
+
+# Day of week pattern 
+DOW_ozone_info = ozone_clean.groupby('DayOfWeek')['Daily Max 8-hour Ozone Concentration'].agg(
+    ['mean', 'std', 'max', 'count']).round(4)
+print('Day of Week Ozone Statistics:')
+print(DOW_ozone_info)
+
+# IsWeekend 
+IsWeekend_ozone_info = ozone_clean.groupby('IsWeekend')['Daily Max 8-hour Ozone Concentration'].agg(
+    ['mean', 'std', 'max', 'count']).round(4)
+print('Weekend Ozone Statistics:')
+print(IsWeekend_ozone_info)
+
+# Monthly pattern 
+monthly_ozone_info = ozone_clean.groupby('Month')['Daily Max 8-hour Ozone Concentration'].agg([
+    'mean', 'std', 'max', 'count']).round(4)
+print('Monthly Ozone Statistics:')
+print(monthly_ozone_info)
+
+# Seasonal pattern
+seasonal_ozone_info = ozone_clean.groupby('Season')['Daily Max 8-hour Ozone Concentration'].agg([
+    'mean', 'std', 'max', 'count']).round(4)
+print("Seasonal Ozone Statistics:")
+print(seasonal_ozone_info)
+```
+
+
+## Stage 2.3: Visualisation of Ozone Concentration Across Conditions
+
+```{python}
+#| echo: false
+#| output: true
+
+# Create comprehensive temporal analysis visualization
+fig = make_subplots(
+    rows=2, cols=2,
+    subplot_titles=('(a) Monthly Average Ozone', '(b) Seasonal Box Plots', 
+                   '(c) Daily Pattern (Day of Week)', '(d) Time Series Trend'),
+    specs=[[{"secondary_y": False}, {"secondary_y": False}],
+           [{"secondary_y": False}, {"secondary_y": False}]]
+)
+
+# Monthly averages
+monthly_avg = ozone_clean.groupby('Month')['Daily Max 8-hour Ozone Concentration'].mean()
+fig.add_trace(
+    go.Scatter(x=list(monthly_avg.index), y=monthly_avg.values, 
+               mode='lines+markers', name='Monthly Average',
+               line=dict(color='blue', width=3)),
+    row=1, col=1
+)
+fig.add_hline(y=0.070, line_dash="dash", line_color="red", 
+              annotation_text="EPA Standard", row=1, col=1)
+# Rotate the x-axis 
+fig.update_xaxes(tickangle=45, row=1, col=1)
+
+# Seasonal box plots
+seasons_order = ['Spring', 'Summer', 'Fall', 'Winter']
+for i, season in enumerate(seasons_order):
+    season_data = ozone_clean[ozone_clean['Season'] == season]['Daily Max 8-hour Ozone Concentration']
+    fig.add_trace(
+        go.Box(y=season_data.values, name=season, boxpoints='outliers'),
+        row=1, col=2
+    )
+
+# Day of week pattern
+dow_avg = ozone_clean.groupby('DayOfWeek')['Daily Max 8-hour Ozone Concentration'].mean()
+dow_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+fig.add_trace(
+    go.Bar(x=dow_names, y=dow_avg.values, name='Daily Average',
+           marker_color=['red' if i < 5 else 'blue' for i in range(7)]),
+    row=2, col=1
+)
+
+# Time series trend
+# 1. Group by BOTH Date and Source
+daily_avg_source = ozone_clean.groupby(['Date_Fixed', 'Source'])['Daily Max 8-hour Ozone Concentration'].mean().reset_index()
+
+# 2. Define colors for each source so they are easy to tell apart
+source_colors = {'AQS': 'blue', 'AirNow': 'orange'}
+
+# 3. Loop through each unique source and add a line for it
+for source_name in daily_avg_source['Source'].unique():
+    
+    # Isolate the data for just this one source
+    source_data = daily_avg_source[daily_avg_source['Source'] == source_name]
+    
+    # Add the trace to row 2, col 2
+    fig.add_trace(
+        go.Scatter(
+            x=source_data['Date_Fixed'], 
+            y=source_data['Daily Max 8-hour Ozone Concentration'],
+            mode='lines', 
+            name=f'Daily Avg ({source_name})', # Names it "Daily Avg (AQS)", etc.
+            line=dict(color=source_colors.get(source_name, 'green'))
+        ),
+        row=2, col=2
+    )
+
+fig.update_xaxes(title_text="Month", row=1, col=1)
+fig.update_yaxes(title_text="Ozone (ppm)", row=1, col=1)
+fig.update_xaxes(title_text="Season", row=1, col=2)
+fig.update_xaxes(title_text="Day of Week", row=2, col=1)
+fig.update_yaxes(title_text="Ozone (ppm)", row=2, col=1)
+fig.update_xaxes(title_text="Date", row=2, col=2)
+
+fig.update_layout(height=900, title_text="Comprehensive Temporal Analysis of Ozone Concentrations (Interactive)", title_x = 0.5, title_y = 0.98, margin = dict(t =80))
+fig.show()
+```
+
+::: {.callout-note title="Visualisation of Ozone Concentration Patterns"}
+1. **Plot (a)** describes the average ozone concentration pattern for each month. We can see a clear, sustained plateau of high ozone concentration between May and October, before dropping to its lowest points from November through April. The red dashed line marks the EPA standard (0.070 ppm), which is not exceeded in the monthly means but is closely approached mid-year.
+
+2. **Plot (b)** describes the ozone concentration distribution across each season. A clear seasonal distinction can be observed here: Summer has the highest median concentration and the highest upper extremes. Additionally, the variability (overall spread) of the ozone concentration is narrowest during Winter, which confirms the low baselines observed in Plot (a).
+
+3. **Plot (c)** describes the average ozone concentration across each day of the week, with red indicating weekday concentrations and blue indicating the weekend. A very slight peak is observed during Wednesday and Thursday, though the overall daily averages remain remarkably flat throughout the week.
+
+4. **Plot (d)** describes the daily ozone concentration over time (Jan 2024 to Dec 2024) from two different reporting sources: AQS and AirNow. We can see a clear divergence between approximately April and September 2024, where the daily measurements reported by AQS were noticeably more volatile and frequently higher than the measurements from AirNow.
+:::
+
+## Stage 2.3: Geographical Hotspots & Data Source Discrepancies
+
+### Site Comparison: Top 10 vs. Bottom 10
+
+::: {layout="[[1, 1], [1, 1]]"}
+
+::: {#top-aqs}
+#### Top 10: AQS
+| Site ID | Local Site Name | Avg Ozone (ppm) |
+|:---|:---|---:|
+| 61070006 | Sequoia & Kings Canyon NPs | 0.061797 |
+| 60710005 | Crestline | 0.059619 |
+| 60714003 | Redlands | 0.059526 |
+| 60651016 | Morongo Air Monitoring Station | 0.058807 |
+| 60719004 | San Bernardino | 0.058662 |
+| 60658001 | Rubidoux | 0.057941 |
+| 60376012 | Santa Clarita | 0.057413 |
+| 60370016 | Glendora | 0.057016 |
+| 60650012 | Banning Airport | 0.056565 |
+| 60658005 | Mira Loma (Van Buren) | 0.055288 |
+:::
+
+::: {#top-airnow}
+#### Top 10: AirNow
+| Site ID | Local Site Name | Avg Ozone (ppm) |
+|:---|:---|---:|
+| 61070006 | Sequoia & Kings Canyon NPs | 0.058598 |
+| 60990005 | Modesto-14th Street | 0.054400 |
+| 60295002 | Arvin-Di Giorgio | 0.054333 |
+| 60650012 | Banning Airport | 0.053000 |
+| 60254004 | Niland-English Road | 0.051868 |
+| 61072010 | Porterville | 0.051643 |
+| 60251003 | El Centro-9th Street | 0.051000 |
+| 60650010 | Joshua Tree NP | 0.050750 |
+| 60731022 | El Cajon - Lexington Elem. | 0.050500 |
+| 60254003 | Westmorland | 0.049444 |
+:::
+
+::: {#bottom-aqs}
+#### Bottom 10: AQS
+| Site ID | Local Site Name | Avg Ozone (ppm) |
+|:---|:---|---:|
+| 60831021 | Carpinteria | 0.020746 |
+| 60850005 | San Jose - Jackson | 0.026295 |
+| 60670011 | Elk Grove-Bruceville | 0.026816 |
+| 60750005 | San Francisco | 0.027812 |
+| 60131002 | Bethel Island | 0.028287 |
+| 60010007 | Livermore | 0.029292 |
+| 60010009 | Oakland | 0.029358 |
+| 60010011 | Oakland West | 0.029365 |
+| 60850002 | Gilroy | 0.029533 |
+| 60450011 | Ukiah-Municipal Airport | 0.029577 |
+:::
+
+::: {#bottom-airnow}
+#### Bottom 10: AirNow
+| Site ID | Local Site Name | Avg Ozone (ppm) |
+|:---|:---|---:|
+| 60739991 | La Posta Band of Indians | 0.009364 |
+| 60610006 | Roseville-N Sunrise Ave | 0.017000 |
+| 61030007 | Red Bluff-Walnut St. | 0.017667 |
+| 60590007 | Anaheim | 0.018000 |
+| 61072003 | Visalia-W. Ashland Avenue | 0.018278 |
+| 60392010 | Madera-City | 0.021000 |
+| 60371103 | Los Angeles-N. Main St. | 0.021500 |
+| 60831021 | Carpinteria | 0.021667 |
+| 60311004 | Hanford-Irwin | 0.021667 |
+| 60290232 | Oildale | 0.022000 |
+:::
+
+:::
+
+::: {.callout-note title="Key Insights: AQS vs. AirNow Data Discrepancies"}
+A direct comparison of the specific monitoring sites in the Top 10 and Bottom 10 lists reveals surprisingly little overlap between the two data sources, exposing significant geographical biases and sensor anomalies in the real-time AirNow network:
+
+1. **Top 10 Overlap (Only 2 Sites) & The "Mountain Trap" Effect:** While both sources agree that *Sequoia & Kings Canyon* is highly polluted, they disagree on the rest of the state. The official AQS record shows extreme pollution tightly clustered in the San Bernardino/Inland Empire region. AirNow largely misses this cluster, scattering its top sites across the Central Valley. This supports the "Mountain Trap" effect, where urban emissions are blown inland and bake against high-altitude, forested areas, which AirNow's network appears to underestimate.
+
+2. **AirNow Underestimates Extremes:** Real-time sensors frequently fail to capture the absolute peak of extreme pollution events. The AQS #1 site recorded **0.061 ppm**, while the AirNow equivalent peaked at only **0.058 ppm**. AQS data undergoes strict EPA quality assurance (QA/QC) that frequently adjusts these extreme peaks upward, making it the only reliable source for historical maximums.
+
+3. **Bottom 10 Overlap (Only 1 Site) & "False Clean" Anomalies:** The AQS list makes perfect meteorological sense, with the cleanest air consistently found in coastal Bay Area cities with strong ocean breezes (e.g., San Francisco, Oakland). AirNow fails to capture this trend entirely. Instead, AirNow erroneously ranks heavily urbanized and notoriously polluted cities (like Los Angeles, Anaheim, and Visalia) as having the "cleanest" air in the state. These impossibly low values (e.g., 0.018 ppm) point definitively to uncorrected sensor failures resulting in artificial "zero-readings."
+
+**Conclusion:** The discrepancies between AQS and AirNow go far beyond minor numerical differences. Relying solely on uncalibrated AirNow data for historical analysis would fundamentally misidentify the safest and most hazardous regions of California.
+:::
+
+```{python}
+#| echo: false
+#| output: true
+
+Ozone_site_info = ozone_clean.groupby(['Local Site Name', 'Site ID']).agg({
+   'Daily Max 8-hour Ozone Concentration':['mean', 'std', 'max', 'count'],
+   'Daily AQI Value': 'mean',
+   'Site Latitude' : 'first',
+   'Site Longitude': 'first',
+   'County': 'first'}).round(4)
+
+# Flatten the stacked column names
+# Since we know exactly which 7 columns we created, the safest and cleanest way 
+# is to just assign a new list of names in the exact order they appear.
+Ozone_site_info.columns = [
+    'ozone_concentration_mean', 
+    'ozone_concentration_std', 
+    'ozone_concentration_max', 
+    'ozone_concentration_count', 
+    'aqi_mean', 
+    'latitude', 
+    'longitude',
+    'county'
+]
+
+# 2. Extract County and Site Name from the index
+# This takes the "grouped" index on the left and splits it back into regular, usable columns
+Ozone_site_info = Ozone_site_info.reset_index()
+
+# 3. Rename the extracted columns to be a bit cleaner
+Ozone_site_info = Ozone_site_info.rename(columns={'Local Site Name': 'site_name', 'Site ID' : 'site_id'})
+
+# Filter sites with sufficient data (at least 30 records)
+Ozone_site_info_filtered = Ozone_site_info[Ozone_site_info['ozone_concentration_count'] >= 30].copy()
+Ozone_site_info_filtered = Ozone_site_info_filtered.sort_values('ozone_concentration_mean', ascending=False)
+
+# Create interactive map of monitoring sites
+fig = px.scatter_map(
+    Ozone_site_info_filtered.reset_index(),
+    lat='latitude',
+    lon='longitude',
+    size='ozone_concentration_mean',
+    color='ozone_concentration_mean',
+    hover_name='site_name',
+    hover_data={
+        'county': True,
+        'ozone_concentration_mean': ':.4f',
+        'ozone_concentration_count': True
+    },
+    color_continuous_scale='YlOrRd',
+    size_max=20,
+    zoom=5,
+    center={"lat": 36.7783, "lon": -119.4179},
+    map_style="open-street-map",
+    title="California Ozone Monitoring Sites - Average Concentrations (Interactive)"
+)
+
+fig.update_coloraxes(colorbar_title="Average Ozone (ppm)")
+fig.update_layout(height=600)
+fig.show()
+```
+
+## Stage 2.4: Statistical Analysis
+
+Three Mann-Whitney U and Kruskal-Wallis tests were conducted to determine whether ozone concentrations differ significantly across time and data source dimensions. All tests used a significance threshold of α = 0.05.
+
+### Test 1: Weekday vs. Weekend
+A Mann-Whitney U test found **no statistically significant difference** between weekday (n = 41,644) and weekend (n = 13,106) ozone concentrations (U = 215489193.5, p = 0.323). This confirms the pattern observed visually in Plot (c) — the near-flat daily averages are not a sampling artefact but a genuine characteristic of California ozone dynamics, consistent with the well-documented **Weekend Ozone Effect**.
+
+### Test 2: Seasonal Differences
+A Kruskal-Wallis test confirmed that ozone concentrations differ **highly significantly** across the four seasons (H = 7434.6495, p < 0.001). Post-hoc pairwise Mann-Whitney U comparisons (with Bonferroni correction implied) found that **every season pair was significantly different from every other** (all p = 0.0). However, statistical significance alone does not convey the practical magnitude of these differences. Cohen's d effect sizes reveal that:
+
+- **Summer vs. Winter** exhibits the largest separation, confirming Summer as the dominant pollution season.
+- **Spring vs. Fall** shows the smallest effect size, suggesting these transitional seasons produce similar baseline ozone levels.
+
+### Test 3: AQS vs. AirNow
+A Mann-Whitney U test confirmed that AQS and AirNow report **significantly different** ozone concentrations (p < 0.05). This is consistent with the source discrepancies identified in Stage 2.3 - AQS undergoes strict EPA QA/QC post-processing which adjusts extreme peak values upward, while several AirNow sensors appear to produce artificially low readings during sensor failure events, particularly in the Central Valley during summer months.
+
+```{python}
+#| echo: true
+#| output: false
+
+# 1. if ozone concntration significantly different from weekday and weekend 
+
+weekday_ozone = ozone_clean[ozone_clean['IsWeekend'] == False]['Daily Max 8-hour Ozone Concentration']
+weekend_ozone = ozone_clean[ozone_clean['IsWeekend'] == True]['Daily Max 8-hour Ozone Concentration']
+
+stat, p_value = stats.mannwhitneyu(weekday_ozone, weekend_ozone, alternative='two-sided')
+
+results = {
+    'U-statistic': stat,
+    'p-value': round(p_value, 6),
+    'Significant (α=0.05)': p_value < 0.05
+}
+results
+## p-value = 0.3229  not significant, weekend has no meaningful effect on ozone.
+
+# 2. if ozone concntration significantly different across seasons 
+spring = ozone_clean[ozone_clean['Season'] == 'Spring']['Daily Max 8-hour Ozone Concentration']
+summer = ozone_clean[ozone_clean['Season'] == 'Summer']['Daily Max 8-hour Ozone Concentration']
+fall   = ozone_clean[ozone_clean['Season'] == 'Fall']['Daily Max 8-hour Ozone Concentration']
+winter = ozone_clean[ozone_clean['Season'] == 'Winter']['Daily Max 8-hour Ozone Concentration']
+
+stat, p_value = stats.kruskal(spring, summer, fall, winter)
+
+kruskal_results = {
+    'H-statistic': round(stat, 4),
+    'p-value': round(p_value, 6),
+    'Significant (α=0.05)': p_value < 0.05
+}
+kruskal_results
+
+seasons = {'Spring': spring, 'Summer': summer, 'Fall': fall, 'Winter': winter}
+pairs = list(combinations(seasons.keys(), 2))
+
+posthoc_results = {}
+for s1, s2 in pairs:
+    _, p = stats.mannwhitneyu(seasons[s1], seasons[s2], alternative='two-sided')
+    posthoc_results[f'{s1} vs {s2}'] = round(p, 6)
+
+posthoc_results
+
+season_groups = {'Spring': spring, 'Summer': summer, 'Fall': fall, 'Winter': winter}
+season_names = list(season_groups.keys())
+
+# Calculate Cohen's d for all pairs
+cohens_d_matrix = pd.DataFrame(np.zeros((4, 4)), index=season_names, columns=season_names)
+
+for s1, s2 in combinations(season_names, 2):
+    m1, m2 = season_groups[s1].mean(), season_groups[s2].mean()
+    sd1, sd2 = season_groups[s1].std(), season_groups[s2].std()
+    pooled_std = np.sqrt((sd1**2 + sd2**2) / 2)
+    d = (m1 - m2) / pooled_std
+    cohens_d_matrix.loc[s1, s2] = round(d, 3)
+    cohens_d_matrix.loc[s2, s1] = round(-d, 3)
+
+ # 3. if ozone concntration significantly different between two sources 
+AQS_ozone = ozone_clean[ozone_clean['Source'] == 'AQS']['Daily Max 8-hour Ozone Concentration']
+AirNow_ozone = ozone_clean[ozone_clean['Source'] == 'AirNow']['Daily Max 8-hour Ozone Concentration']
+
+stat, p_value = stats.mannwhitneyu(AQS_ozone, AirNow_ozone, alternative='two-sided')
+
+results = {
+    'U-statistic': stat,
+    'p-value': round(p_value, 6),
+    'Significant (α=0.05)': p_value < 0.05
+}
+results
+```
+
+## Stage 3: Conclusion & Recommendations
+
+### Final Synthesis
+This comprehensive analysis of 54,750 daily ozone observations across California in 2024 reveals a complex interplay between geography, seasonal weather, and data reporting methodologies. 
+
+While the state-wide median concentration sits at a relatively safe 0.043 ppm, extreme localized events frequently push ozone levels into hazardous territory (up to 0.106 ppm). The data confirms that ozone is a heavily seasonal pollutant, peaking in July when intense sunlight and heat bake precursor emissions (NOx and VOCs) into ground-level ozone. Interestingly, the "Weekend Effect" demonstrates that reduced commuter traffic on weekends does not lower baseline ozone levels, highlighting the persistent, atmospheric nature of this pollutant.
+
+Most crucially, this analysis uncovered severe geographic and methodological discrepancies between real-time AirNow sensors and the official EPA AQS record. The AQS data exposes the "Mountain Trap" effect—proving that the highest ozone hazards do not stay in the urban centers where the emissions are generated, but rather blow inland to pool against high-altitude, forested areas like Sequoia & Kings Canyon National Parks. 
+
+### Actionable Recommendations
+
+Based on the exploratory data analysis, we recommend the following considerations for environmental policymakers and future researchers:
+
+1. **Prioritize AQS for Historical Analysis:** Researchers must exercise extreme caution when using AirNow data for long-term studies. AirNow's tendency to underestimate peak extreme events and its vulnerability to uncorrected sensor failures (the "False Clean" anomalies) make it unsuitable for historical baseline tracking. The EPA's rigorously QA/QC-checked AQS dataset should remain the sole source of truth for policy-making.
+2. **Shift Focus to Inland Transport:** Urban emission reduction strategies in coastal and valley cities are necessary, but policymakers must recognize that the ultimate victims of these emissions are often inland, high-altitude communities. Mitigation strategies must account for regional wind transport patterns, not just local tailpipe emissions.
+3. **Investigate Central Valley Sensor Reliability:** The high frequency of impossibly low ozone readings (0.009–0.021 ppm) from AirNow sensors in historically polluted regions like Visalia and Oildale requires immediate technical review. Improving the uptime and real-time calibration of these specific sensor networks is critical for providing accurate daily health warnings to vulnerable populations.
